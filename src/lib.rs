@@ -1,8 +1,9 @@
-use std::fmt;
 use std::marker::PhantomData;
+use std::{collections::HashMap, fmt};
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json;
+use serde_with::skip_serializing_none;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 enum Effect {
@@ -16,67 +17,46 @@ impl Default for Effect {
     }
 }
 
+#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "PascalCase")]
 struct Principal {
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "option_string_or_seq_strings",
-        rename = "AWS"
-    )]
+    #[serde(deserialize_with = "option_string_or_seq_strings", rename = "AWS")]
     aws: Option<Vec<String>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "option_string_or_seq_strings"
-    )]
+    #[serde(deserialize_with = "option_string_or_seq_strings")]
     federated: Option<Vec<String>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "option_string_or_seq_strings"
-    )]
+    #[serde(deserialize_with = "option_string_or_seq_strings")]
     service: Option<Vec<String>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "option_string_or_seq_strings"
-    )]
+    #[serde(deserialize_with = "option_string_or_seq_strings")]
     canonical_user: Option<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(untagged)]
+enum ConditionValue {
+    #[serde(deserialize_with = "condition_value")]
+    StringVal(String),
+    SeqVal(Vec<String>),
+}
+
+#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Statement {
-    #[serde(
-        default,
-        deserialize_with = "option_string_or_seq_strings",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     action: Option<Vec<String>>,
     effect: Effect,
-    #[serde(
-        default,
-        deserialize_with = "option_string_or_seq_strings",
-        skip_serializing_if = "Option::is_none"
-    )]
+    condition: Option<HashMap<String, HashMap<String, ConditionValue>>>,
+    #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     not_action: Option<Vec<String>>,
-    #[serde(
-        default,
-        deserialize_with = "option_string_or_seq_strings",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "option_string_or_principal")]
+    not_principal: Option<Principal>,
+    #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     not_resource: Option<Vec<String>>,
-    #[serde(
-        default,
-        deserialize_with = "option_string_or_principal",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "option_string_or_principal")]
     principal: Option<Principal>,
-    #[serde(
-        default,
-        deserialize_with = "option_string_or_seq_strings",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     resource: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     sid: Option<String>,
 }
 
@@ -86,14 +66,13 @@ impl Statement {
     }
 }
 
+#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Policy {
-    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(deserialize_with = "statement_or_seq_statement")]
     statement: Vec<Statement>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
 }
 
@@ -222,9 +201,74 @@ where
     Ok(v.map(|Wrapper(a)| a))
 }
 
+fn condition_value<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrNumberOrBool(PhantomData<String>);
+
+    impl<'de> de::Visitor<'de> for StringOrNumberOrBool {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("string or number or bool")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match value {
+                true => Ok(String::from("true")),
+                false => Ok(String::from("false")),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(StringOrNumberOrBool(PhantomData))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! condition {
+        ($op: expr, $key: expr, $val: expr) => {{
+            let mut inner = ::std::collections::HashMap::new();
+            inner.insert($key, $val);
+            let mut map = ::std::collections::HashMap::new();
+            map.insert($op, inner);
+            map
+        }};
+    }
 
     #[test]
     fn version_serialize_deserialize() {
@@ -321,6 +365,47 @@ mod tests {
             deserialized.statement,
             vec![Statement {
                 not_action: Some(vec![String::from("*")]),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(serialized, original);
+    }
+
+    #[test]
+    fn not_principal_star_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Effect":"Deny","NotPrincipal":"*"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                not_principal: Some(Principal {
+                    aws: Some(vec![String::from("*")]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":["*"]}}]}"#
+        );
+    }
+
+    #[test]
+    fn not_principal_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":["aws"],"Federated":["federated"],"Service":["service"],"CanonicalUser":["canonical_user"]}}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                not_principal: Some(Principal {
+                    aws: Some(vec![String::from("aws")]),
+                    federated: Some(vec![String::from("federated")]),
+                    service: Some(vec![String::from("service")]),
+                    canonical_user: Some(vec![String::from("canonical_user")]),
+                }),
                 ..Default::default()
             }],
         );
@@ -433,5 +518,28 @@ mod tests {
         );
         let serialized = serde_json::to_string(&deserialized).unwrap();
         assert_eq!(serialized, original);
+    }
+
+    #[test]
+    fn condition_string_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Effect":"Deny","Condition":{"NumericLessThanEquals":{"s3:max-keys":10.5}}}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            ConditionValue::StringVal("10.5".to_string())
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Effect":"Deny","Condition":{"NumericLessThanEquals":{"s3:max-keys":"10.5"}}}]}"#
+        );
     }
 }
