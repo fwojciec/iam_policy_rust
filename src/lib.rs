@@ -1,3 +1,5 @@
+mod statement;
+
 use std::marker::PhantomData;
 use std::{collections::HashMap, fmt};
 
@@ -31,22 +33,15 @@ struct Principal {
     canonical_user: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
-#[serde(untagged)]
-enum ConditionValue {
-    #[serde(deserialize_with = "condition_value")]
-    StringVal(String),
-    SeqVal(Vec<String>),
-}
-
 #[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Statement {
     #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     action: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "option_condition_map")]
+    condition: Option<HashMap<String, HashMap<String, Vec<String>>>>,
     effect: Effect,
-    condition: Option<HashMap<String, HashMap<String, ConditionValue>>>,
     #[serde(default, deserialize_with = "option_string_or_seq_strings")]
     not_action: Option<Vec<String>>,
     #[serde(default, deserialize_with = "option_string_or_principal")]
@@ -138,7 +133,11 @@ where
         where
             A: de::SeqAccess<'de>,
         {
-            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
+            let mut res: Vec<String> =
+                Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+            res = res.into_iter().map(|item| item.to_lowercase()).collect();
+            res.sort();
+            Ok(res)
         }
     }
 
@@ -201,63 +200,70 @@ where
     Ok(v.map(|Wrapper(a)| a))
 }
 
-fn condition_value<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn condition_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, HashMap<String, Vec<String>>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct StringOrNumberOrBool(PhantomData<String>);
+    let temp_map: HashMap<String, HashMap<String, serde_json::Value>> =
+        HashMap::deserialize(deserializer)?;
 
-    impl<'de> de::Visitor<'de> for StringOrNumberOrBool {
-        type Value = String;
+    let mut map: HashMap<String, HashMap<String, Vec<String>>> =
+        HashMap::with_capacity(temp_map.len());
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("string or number or bool")
+    for (condition_type, inner_temp_map) in temp_map {
+        let mut inner_map: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(inner_temp_map.len());
+        for (condition_key, value) in inner_temp_map {
+            let parsed = match value {
+                serde_json::Value::Array(seq) => seq
+                    .into_iter()
+                    .map(|v| value_to_string(v).map_err(serde::de::Error::custom))
+                    .collect::<Result<Vec<String>, _>>(),
+
+                _ => {
+                    let parsed = value_to_string(value).map_err(serde::de::Error::custom)?;
+                    Ok(vec![parsed])
+                }
+            };
+            inner_map.insert(condition_key, parsed?);
         }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_owned())
-        }
-
-        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            match value {
-                true => Ok(String::from("true")),
-                false => Ok(String::from("false")),
-            }
-        }
+        map.insert(condition_type, inner_map);
     }
 
-    deserializer.deserialize_any(StringOrNumberOrBool(PhantomData))
+    Ok(map)
+}
+
+fn value_to_string(value: serde_json::Value) -> Result<String, serde::de::value::Error> {
+    match value {
+        serde_json::Value::String(v) => Ok(v),
+        serde_json::Value::Bool(v) => Ok(v.to_string()),
+        serde_json::Value::Number(v) => Ok(v.to_string()),
+        _ => Err(serde::de::Error::custom(
+            "unexpected value, expected string, bool or number",
+        )),
+    }
+}
+
+fn option_condition_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, HashMap<String, Vec<String>>>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrapper(
+        #[serde(deserialize_with = "condition_map")] HashMap<String, HashMap<String, Vec<String>>>,
+    );
+
+    let v = Option::deserialize(deserializer)?;
+    Ok(v.map(|Wrapper(a)| a))
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     macro_rules! condition {
@@ -522,12 +528,12 @@ mod tests {
 
     #[test]
     fn condition_string_value_serialize_deserialize() {
-        let original = r#"{"Statement":[{"Effect":"Deny","Condition":{"NumericLessThanEquals":{"s3:max-keys":10.5}}}]}"#;
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":"I'm a string"}},"Effect":"Deny"}]}"#;
         let deserialized = Policy::from_str(original).unwrap();
         let condition = condition!(
             "NumericLessThanEquals".to_string(),
             "s3:max-keys".to_string(),
-            ConditionValue::StringVal("10.5".to_string())
+            vec!["I'm a string".to_string()]
         );
         assert_eq!(
             deserialized.statement,
@@ -539,7 +545,122 @@ mod tests {
         let serialized = serde_json::to_string(&deserialized).unwrap();
         assert_eq!(
             serialized,
-            r#"{"Statement":[{"Effect":"Deny","Condition":{"NumericLessThanEquals":{"s3:max-keys":"10.5"}}}]}"#
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["I'm a string"]}},"Effect":"Deny"}]}"#
+        );
+    }
+
+    #[test]
+    fn condition_bool_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":true}},"Effect":"Deny"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            vec!["true".to_string()]
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["true"]}},"Effect":"Deny"}]}"#
+        );
+    }
+
+    #[test]
+    fn condition_number_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":10}},"Effect":"Deny"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            vec!["10".to_string()]
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["10"]}},"Effect":"Deny"}]}"#
+        );
+    }
+
+    #[test]
+    fn condition_string_array_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["string"]}},"Effect":"Deny"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            vec!["string".to_string()]
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["string"]}},"Effect":"Deny"}]}"#
+        );
+    }
+
+    #[test]
+    fn condition_bool_array_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":[true]}},"Effect":"Deny"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            vec!["true".to_string()]
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["true"]}},"Effect":"Deny"}]}"#
+        );
+    }
+
+    #[test]
+    fn condition_number_array_value_serialize_deserialize() {
+        let original = r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":[33.3]}},"Effect":"Deny"}]}"#;
+        let deserialized = Policy::from_str(original).unwrap();
+        let condition = condition!(
+            "NumericLessThanEquals".to_string(),
+            "s3:max-keys".to_string(),
+            vec!["33.3".to_string()]
+        );
+        assert_eq!(
+            deserialized.statement,
+            vec![Statement {
+                condition: Some(condition),
+                ..Default::default()
+            }],
+        );
+        let serialized = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"Statement":[{"Condition":{"NumericLessThanEquals":{"s3:max-keys":["33.3"]}},"Effect":"Deny"}]}"#
         );
     }
 }
